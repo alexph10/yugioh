@@ -1,45 +1,54 @@
-"""
-Download up to 10,000 Yu-Gi-Oh! card images locally using the YGOPRODeck API.
-
-Source:
-- Metadata endpoint: https://db.ygoprodeck.com/api/v7/cardinfo.php
-- Image URLs come from each card's `card_images` array
-
-Notes:
-- The API guide says to download/store locally and not hotlink images.
-- Be respectful with request rate. This script uses a conservative worker count.
-"""
-
 from __future__ import annotations
 
 import csv
-import json
-import os
 import re
 import sys
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple
+from pathlib import Path
+from threading import local
+from typing import Any
 
 import requests
 
+
+def find_repo_root(start: Path) -> Path:
+    current = start.resolve()
+    for candidate in [current.parent, *current.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    for candidate in [current.parent, *current.parents]:
+        if (candidate / "src").exists():
+            return candidate
+    return current.parent
+
+
+REPO_ROOT = find_repo_root(Path(__file__))
 API_URL = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
-OUTPUT_DIR = Path("yugioh_cards_10000")
-IMAGES_DIR = OUTPUT_DIR / "data/raw/yugioh_cards"
+OUTPUT_DIR = REPO_ROOT / "data" / "raw" / "yugioh_cards"
+IMAGES_DIR = OUTPUT_DIR
 MANIFEST_CSV = OUTPUT_DIR / "manifest.csv"
 FAILURES_CSV = OUTPUT_DIR / "failures.csv"
 
 TARGET_COUNT = 10_000
 MAX_WORKERS = 8
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = (5, 30)
 RETRIES = 4
 BACKOFF_BASE = 1.5
+# ygoprodeck asks clients to rate-limit themselves to ~20 req/sec.
+PER_REQUEST_DELAY = 0.06
 
-session = requests.Session()
-session.headers.update(
-    {"User-Agent": "Mozilla/5.0 (compatible; yugioh-image-downloader/1.0)"}
-)
+_thread_state = local()
+
+
+def get_session() -> requests.Session:
+    if not hasattr(_thread_state, "session"):
+        s = requests.Session()
+        s.headers.update(
+            {"User-Agent": "Mozilla/5.0 (compatible; yugioh-image-downloader/1.0)"}
+        )
+        _thread_state.session = s
+    return _thread_state.session
 
 
 def slugify(text: str) -> str:
@@ -48,16 +57,21 @@ def slugify(text: str) -> str:
     return text.strip("-") or "card"
 
 
-def fetch_all_cards() -> List[dict]:
-    r = session.get(API_URL, timeout=REQUEST_TIMEOUT)
+def fetch_all_cards() -> list[dict[str, Any]]:
+    print(f"Fetching card metadata from {API_URL} ...", flush=True)
+    r = get_session().get(API_URL, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    return data["data"]
+    cards = data.get("data", [])
+    print(f"Received metadata for {len(cards):,} cards.", flush=True)
+    return cards
 
 
-def build_download_list(cards: List[dict], target_count: int) -> List[Dict]:
-    items = []
-    seen_urls = set()
+def build_download_list(
+    cards: list[dict[str, Any]], target_count: int
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
 
     for card in cards:
         card_name = card.get("name", "unknown")
@@ -71,8 +85,6 @@ def build_download_list(cards: List[dict], target_count: int) -> List[Dict]:
                 continue
 
             seen_urls.add(image_url)
-
-            # If a card has alt artworks, keep them distinct.
             alt_suffix = f"-alt{idx}" if idx > 1 else ""
             filename = f"{image_id}{alt_suffix}-{slugify(card_name)}.jpg"
 
@@ -93,13 +105,15 @@ def build_download_list(cards: List[dict], target_count: int) -> List[Dict]:
     return items
 
 
-def download_one(item: Dict) -> Tuple[bool, Dict, str]:
+def download_one(item: dict[str, Any]) -> tuple[bool, dict[str, Any], str]:
     dest = IMAGES_DIR / item["filename"]
 
     if dest.exists() and dest.stat().st_size > 0:
         return True, item, "exists"
 
     last_error = ""
+    session = get_session()
+
     for attempt in range(1, RETRIES + 1):
         try:
             with session.get(
@@ -110,14 +124,19 @@ def download_one(item: Dict) -> Tuple[bool, Dict, str]:
                 if "image" not in content_type.lower():
                     raise ValueError(f"Unexpected content type: {content_type}")
 
-                with open(dest, "wb") as f:
+                tmp = dest.with_suffix(dest.suffix + ".part")
+                with open(tmp, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
 
-            if dest.stat().st_size == 0:
-                raise ValueError("Downloaded file is empty")
+                if tmp.stat().st_size == 0:
+                    tmp.unlink(missing_ok=True)
+                    raise ValueError("Downloaded file is empty")
 
+                tmp.replace(dest)
+
+            time.sleep(PER_REQUEST_DELAY)
             return True, item, "downloaded"
 
         except Exception as e:
@@ -127,119 +146,113 @@ def download_one(item: Dict) -> Tuple[bool, Dict, str]:
                     dest.unlink()
                 except OSError:
                     pass
-            time.sleep(BACKOFF_BASE**attempt)
+            if attempt < RETRIES:
+                time.sleep(BACKOFF_BASE**attempt)
 
     return False, item, last_error
 
 
-def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+def write_manifest(rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "card_name",
+        "card_id",
+        "image_id",
+        "image_index",
+        "image_url",
+        "filename",
+        "status",
+    ]
+    with open(MANIFEST_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
 
-    print("Fetching card metadata...")
-    cards = fetch_all_cards()
-    print(f"Total cards returned by API: {len(cards)}")
+
+def write_failures(rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "card_name",
+        "card_id",
+        "image_id",
+        "image_index",
+        "image_url",
+        "filename",
+        "error",
+    ]
+    with open(FAILURES_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def main() -> int:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        cards = fetch_all_cards()
+    except requests.RequestException as e:
+        print(f"ERROR: failed to fetch card list: {e}", file=sys.stderr)
+        return 1
 
     items = build_download_list(cards, TARGET_COUNT)
-    print(f"Prepared {len(items)} image URLs for download.")
+    print(
+        f"Prepared {len(items):,} image targets (goal: {TARGET_COUNT:,}).",
+        flush=True,
+    )
+    if not items:
+        print("Nothing to download.", file=sys.stderr)
+        return 1
 
-    with open(MANIFEST_CSV, "w", newline="", encoding="utf-8") as mf:
-        writer = csv.DictWriter(
-            mf,
-            fieldnames=[
-                "card_name",
-                "card_id",
-                "image_id",
-                "image_index",
-                "image_url",
-                "filename",
-                "status",
-            ],
-        )
-        writer.writeheader()
+    successes: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    downloaded = 0
+    skipped = 0
+    total = len(items)
+    started = time.time()
 
-    with open(FAILURES_CSV, "w", newline="", encoding="utf-8") as ff:
-        writer = csv.DictWriter(
-            ff,
-            fieldnames=[
-                "card_name",
-                "card_id",
-                "image_id",
-                "image_index",
-                "image_url",
-                "filename",
-                "error",
-            ],
-        )
-        writer.writeheader()
-
-    completed = 0
-    success_count = 0
-    failure_count = 0
-
-    print(f"Starting downloads with {MAX_WORKERS} workers...")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(download_one, item): item for item in items}
-
-        for future in as_completed(futures):
-            ok, item, message = future.result()
-            completed += 1
-
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_map = {pool.submit(download_one, it): it for it in items}
+        for i, fut in enumerate(as_completed(future_map), start=1):
+            ok, item, info = fut.result()
             if ok:
-                success_count += 1
-                with open(MANIFEST_CSV, "a", newline="", encoding="utf-8") as mf:
-                    writer = csv.DictWriter(
-                        mf,
-                        fieldnames=[
-                            "card_name",
-                            "card_id",
-                            "image_id",
-                            "image_index",
-                            "image_url",
-                            "filename",
-                            "status",
-                        ],
-                    )
-                    row = dict(item)
-                    row["status"] = message
-                    writer.writerow(row)
+                item = {**item, "status": info}
+                successes.append(item)
+                if info == "downloaded":
+                    downloaded += 1
+                else:
+                    skipped += 1
             else:
-                failure_count += 1
-                with open(FAILURES_CSV, "a", newline="", encoding="utf-8") as ff:
-                    writer = csv.DictWriter(
-                        ff,
-                        fieldnames=[
-                            "card_name",
-                            "card_id",
-                            "image_id",
-                            "image_index",
-                            "image_url",
-                            "filename",
-                            "error",
-                        ],
-                    )
-                    row = dict(item)
-                    row["error"] = message
-                    writer.writerow(row)
+                failures.append({**item, "error": info})
 
-            if completed % 100 == 0 or completed == len(items):
+            if i % 50 == 0 or i == total:
+                elapsed = time.time() - started
+                rate = i / elapsed if elapsed > 0 else 0.0
                 print(
-                    f"Progress: {completed}/{len(items)} | "
-                    f"ok={success_count} fail={failure_count}"
+                    f"[{i:>5}/{total}] downloaded={downloaded} "
+                    f"skipped={skipped} failed={len(failures)} "
+                    f"({rate:.1f} img/s)",
+                    flush=True,
                 )
 
-    print("\nDone.")
-    print(f"Downloaded: {success_count}")
-    print(f"Failed:     {failure_count}")
-    print(f"Images dir: {IMAGES_DIR.resolve()}")
-    print(f"Manifest:   {MANIFEST_CSV.resolve()}")
-    print(f"Failures:   {FAILURES_CSV.resolve()}")
+    write_manifest(successes)
+    if failures:
+        write_failures(failures)
+
+    elapsed = time.time() - started
+    print(
+        f"\nDone in {elapsed:.1f}s. "
+        f"saved={len(successes)} (new={downloaded}, existing={skipped}) "
+        f"failed={len(failures)}",
+        flush=True,
+    )
+    print(f"Images: {IMAGES_DIR}", flush=True)
+    print(f"Manifest: {MANIFEST_CSV}", flush=True)
+    if failures:
+        print(f"Failures: {FAILURES_CSV}", flush=True)
+
+    return 0 if len(successes) > 0 else 1
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-        sys.exit(1)
+    raise SystemExit(main())
