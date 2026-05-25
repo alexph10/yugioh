@@ -1,1 +1,15 @@
+# Core ML
+torch>=2.3
+torchvision>=0.18
+numpy>=1.24
+
+# Imaging
+Pillow>=10.0
+
+# Data scraping
 requests>=2.31
+
+# Testing and tooling
+pytest>=7.4
+ruff>=0.5
+mypy>=1.10
